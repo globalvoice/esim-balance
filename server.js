@@ -5,41 +5,29 @@ const PORT = process.env.PORT || 8787;
 const ESIMGO_KEY = process.env.ESIMGO_KEY;
 const ESIMGO_VER = process.env.ESIMGO_VER || "v2.5";
 
-if (!ESIMGO_KEY) {
-  console.warn("[WARN] ESIMGO_KEY env var is not set");
+app.use(express.json()); // <-- IMPORTANT
+
+const toGB = (n) => Number((n / 1_000_000_000).toFixed(2));
+
+function pickIccid(req) {
+  // Accept from body, query, or header (flexible for any client)
+  return String(
+    (req.body && req.body.iccid) ||
+    (req.query && req.query.iccid) ||
+    req.headers["x-iccid"] ||
+    ""
+  ).trim();
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/balance", async (req, res) => {
+app.all("/balance-clean", async (req, res) => {
   try {
-    const iccid = String(req.query.iccid || "").trim();
+    const iccid = pickIccid(req);
     if (!iccid) return res.status(400).json({ error: "missing iccid" });
 
     const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
-    console.log(`[balance] GET ${url}`);
-
-    const r = await fetch(url, {
-      headers: { "X-API-Key": ESIMGO_KEY, "Accept": "application/json" }
-    });
-
-    const text = await r.text();
-    console.log(`[balance] esimgo status=${r.status} len=${text.length}`);
-
-    res.status(r.status).type("application/json").send(text);
-  } catch (e) {
-    console.error("[balance] ERROR", e);
-    res.status(500).json({ error: "proxy_error", detail: String(e) });
-  }
-});
-
-app.get("/balance-clean", async (req, res) => {
-  try {
-    const iccid = String(req.query.iccid || "").trim();
-    if (!iccid) return res.status(400).json({ error: "missing iccid" });
-
-    const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
-    console.log(`[balance-clean] GET ${url}`);
+    console.log(`[balance-clean] ${req.method} -> ${url}`);
 
     const r = await fetch(url, {
       headers: { "X-API-Key": ESIMGO_KEY, "Accept": "application/json" }
@@ -54,10 +42,9 @@ app.get("/balance-clean", async (req, res) => {
     const body = JSON.parse(text);
     const b = body?.bundles?.[0] || {};
     const a = b?.assignments?.[0] || {};
+
     const initialBytes   = a?.initialQuantity ?? a?.allowances?.[0]?.initialAmount ?? 0;
     const remainingBytes = a?.remainingQuantity ?? a?.allowances?.[0]?.remainingAmount ?? 0;
-
-    const toGB = n => Number((n / 1_000_000_000).toFixed(2));
 
     const out = {
       planName: a?.name || b?.name || "",
