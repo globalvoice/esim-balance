@@ -58,6 +58,7 @@ const ISO2_COUNTRIES = {
   LT: "Lithuania",
   MX: "Mexico",
   RU: "Rusia",
+  REUP: "Europe"
   // add regions you sell most often
 };
 
