@@ -128,7 +128,6 @@ app.all("/balance-clean", async (req, res) => {
   }
 });
 
-// Raw passthrough
 app.all("/balance", async (req, res) => {
   try {
     if (!ESIMGO_KEY) return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY not set" });
