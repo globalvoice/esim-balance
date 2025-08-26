@@ -62,23 +62,32 @@ const ISO2_COUNTRIES = {
   // add regions you sell most often
 };
 
-function extractIso2FromName(name = "") {
-  // Prefer a trailing _XX or _XX_V2 pattern (e.g., esims_10GB_30D_GR_V2)
-  const m1 = name.match(/_([A-Z]{2})(?:_[Vv]\d+)?$/);
-  if (m1) return m1[1];
-  // Fallback: first _XX occurrence
-  const m2 = name.match(/_([A-Z]{2})(?:_|$)/);
-  return m2 ? m2[1] : null;
-}
+// Regions or marketing bundles
+const REGION_CODES = {
+  REUP: "Europe+",
+  EURO: "Europe",
+  APAC: "Asia Pacific",
+  LATAM: "Latin America",
+  MENA: "Middle East & North Africa",
+  GLOBAL: "Global",
+};
 
-function extractIso2FromDesc(desc = "") {
-  // Very loose: find any isolated 2-letter uppercase token
-  const m = desc.match(/(?:^|[^A-Z])([A-Z]{2})(?:[^A-Z]|$)/);
-  return m ? m[1] : null;
-}
+function extractRegionOrIso2(planName = "") {
+  // First check for 4–5 letter region codes like REUP, APAC, LATAM
+  const regionMatch = planName.match(/_([A-Z]{3,5})(?:_[Vv]\d+)?$/);
+  if (regionMatch) {
+    const code = regionMatch[1];
+    if (REGION_CODES[code]) return { type: "region", code, label: REGION_CODES[code] };
+  }
 
-function iso2ToCountry(iso2) {
-  return iso2 ? (ISO2_COUNTRIES[iso2] || iso2) : "";
+  // Otherwise check for ISO2 at the end
+  const m1 = planName.match(/_([A-Z]{2})(?:_[Vv]\d+)?$/);
+  if (m1) {
+    const code = m1[1];
+    if (ISO2_COUNTRIES[code]) return { type: "country", code, label: ISO2_COUNTRIES[code] };
+  }
+
+  return { type: "unknown", code: "", label: "" };
 }
 
 // ---- Routes ----
@@ -114,6 +123,8 @@ app.all("/balance-clean", async (req, res) => {
 
     const planName = a?.name || b?.name || "";
     const description = a?.description || b?.description || "";
+    const regionOrCountry = extractRegionOrIso2(planName);
+const country = regionOrCountry.label || "";  // will be "Europe+" for REUP
 
     // Bytes → GB, with allowances fallback
     const initialBytes   = a?.initialQuantity ?? a?.allowances?.[0]?.initialAmount ?? 0;
