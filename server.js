@@ -1,9 +1,8 @@
 // server.js
 // Minimal proxy for Retell/agents
-// - /balance-clean: eSIMGo usage + friendly country/region
-// - /balance: raw eSIMGo passthrough
-// - /plans-by-destination: GlobalESIM coverage -> plans summary (form-encoded, PHP-friendly)
-// CommonJS + Node 18+ (global fetch)
+// - /balance-clean, /balance: eSIMGo usage (GB) + friendly country/region (multiple ICCID input styles)
+// - /plans-by-destination: GlobalESIM coverage -> plans (form-encoded, PHP-friendly, includes Unlimited, limitable)
+// - /health
 
 const express = require("express");
 
@@ -18,17 +17,22 @@ const ESIMGO_VER = process.env.ESIMGO_VER || "v2.5";     // e.g., "v2.4" if need
 const GLOBALESIM_EMAIL = process.env.GLOBALESIM_EMAIL || "";
 const GLOBALESIM_PASSWORD = process.env.GLOBALESIM_PASSWORD || "";
 
-// ---- Basic hardening / JSON ----
+// ---- Basic hardening / parsers ----
 app.disable("x-powered-by");
 app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // allow form bodies if a client sends them
 
-// ---- Utilities ----
+// ---- Helpers ----
 const toGB = (n) => Number((Number(n || 0) / 1_000_000_000).toFixed(2));
 
 function pickIccid(req) {
+  // Accept ICCID from body, nested body, query, header, or path.
+  // Covers Retell variants and manual curl tests.
   return String(
-    (req.body && req.body.iccid) ||
-    (req.query && req.query.iccid) ||
+    (req.params && req.params.iccid) ||
+    (req.body && (req.body.iccid ||
+                  (req.body.arguments && req.body.arguments.iccid))) ||
+    (req.query && (req.query.iccid || req.query.ICCID)) ||
     req.headers["x-iccid"] ||
     ""
   ).trim();
@@ -130,11 +134,54 @@ function pickCoverageRecord(dest, coverageList = []) {
   return null;
 }
 
-function formatTopPlans(plans = [], limit = 5) {
-  const top = plans.slice(0, limit);
-  return top
-    .map(p => `${Number(p.GBs)} GB / ${Number(p.Validity_Days)} days — $${Number(p.retailRate)}`)
-    .join("; ");
+// ---- Plan normalization (includes Unlimited) ----
+function normalizePlanRecord(p) {
+  const desc = String(p.Description || "");
+  const usku = String(p.usku || "");
+  const GBsRaw = String(p.GBs);
+
+  const isUnlimited =
+    /unlimited/i.test(desc) ||
+    /unl/i.test(usku) ||
+    GBsRaw.toLowerCase() === "unlimited" ||
+    GBsRaw.toLowerCase() === "unl" ||
+    GBsRaw === "0"; // some providers use 0 to mean unlimited
+
+  const gbsNum = isUnlimited ? Number.POSITIVE_INFINITY : Number(p.GBs);
+
+  return {
+    brandId: p.brandId,
+    planId: p.planId,
+    GBs: isUnlimited ? "Unlimited" : Number(p.GBs),
+    gbsNum, // for sorting
+    Validity_Days: Number(p.Validity_Days),
+    retailRate: Number(p.retailRate),
+    dealerRate: Number(p.dealerRate ?? 0),
+    usku,
+    description: desc,
+    isUnlimited
+  };
+}
+
+function sortPlans(a, b) {
+  // Finite GBs first (ascending), then Unlimited, then by days, then price
+  if (isFinite(a.gbsNum) && isFinite(b.gbsNum)) {
+    if (a.gbsNum !== b.gbsNum) return a.gbsNum - b.gbsNum;
+  } else if (isFinite(a.gbsNum) && !isFinite(b.gbsNum)) {
+    return -1;
+  } else if (!isFinite(a.gbsNum) && isFinite(b.gbsNum)) {
+    return 1;
+  }
+  if (a.Validity_Days !== b.Validity_Days) return a.Validity_Days - b.Validity_Days;
+  return a.retailRate - b.retailRate;
+}
+
+function formatPlans(plans = [], limit = 10) {
+  const list = plans.slice(0, limit);
+  return list.map(p => {
+    const gbPart = p.isUnlimited ? "Unlimited data" : `${p.GBs} GB`;
+    return `${gbPart} / ${p.Validity_Days} days — $${p.retailRate}`;
+  }).join("; ");
 }
 
 // ---- Form helpers (for PHP endpoints) ----
@@ -161,15 +208,19 @@ async function postForm(url, data) {
 }
 
 // ---- Routes ----
+
 app.get("/health", (req, res) => res.json({ ok: true, ver: ESIMGO_VER }));
 
-// eSIMGo: processed usage
-app.all("/balance-clean", async (req, res) => {
+// eSIMGo: processed usage (path, query, body all supported)
+app.all("/balance-clean/:iccid?", async (req, res) => {
   try {
     if (!ESIMGO_KEY) return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY not set" });
 
     const iccid = pickIccid(req);
-    if (!iccid) return res.status(400).json({ error: "missing iccid" });
+    if (!iccid) {
+      console.log("[balance-clean] missing iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
+      return res.status(400).json({ error: "missing iccid" });
+    }
 
     const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
     console.log(`[balance-clean] -> ${url}`);
@@ -208,13 +259,16 @@ app.all("/balance-clean", async (req, res) => {
   }
 });
 
-// eSIMGo: raw passthrough
-app.all("/balance", async (req, res) => {
+// eSIMGo: raw passthrough (path, query, body all supported)
+app.all("/balance/:iccid?", async (req, res) => {
   try {
     if (!ESIMGO_KEY) return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY not set" });
 
     const iccid = pickIccid(req);
-    if (!iccid) return res.status(400).json({ error: "missing iccid" });
+    if (!iccid) {
+      console.log("[balance] missing iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
+      return res.status(400).json({ error: "missing iccid" });
+    }
 
     const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
     console.log(`[balance] -> ${url}`);
@@ -228,17 +282,21 @@ app.all("/balance", async (req, res) => {
   }
 });
 
-// GlobalESIM: coverage -> plans by destination (form-encoded; tolerant to Retell probes; fallback to .php)
+// GlobalESIM: coverage -> plans by destination (form-encoded; tolerant to Retell probes; fallback to .php; includes Unlimited)
 app.all("/plans-by-destination", async (req, res) => {
   try {
     // Accept from body or query; default "Europe" for save/probes with no payload
     let destination =
-      (req.body && req.body.destination) ||
-      (req.query && req.query.destination) ||
+      (req.body && (req.body.destination || (req.body.arguments && req.body.arguments.destination))) ||
+      (req.query && (req.query.destination)) ||
       "Europe";
 
-    destination = String(destination).trim();
+    destination = String(destination || "").trim();
     if (!destination) destination = "Europe";
+
+    // Optional limit for how many to speak/return in 'topText'
+    const limitParam = Number(req.query?.limit || req.body?.limit || 10);
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 50) : 10;
 
     if (!GLOBALESIM_EMAIL || !GLOBALESIM_PASSWORD) {
       return res.status(500).json({ error: "config_error", detail: "GLOBALESIM_EMAIL/PASSWORD not set" });
@@ -305,32 +363,22 @@ app.all("/plans-by-destination", async (req, res) => {
     }
 
     const plansRaw = Array.isArray(plansJson?.Data) ? plansJson.Data : [];
+    const normalized = plansRaw.map(normalizePlanRecord).sort(sortPlans);
 
-    const normalized = plansRaw
-      .map(p => ({
-        brandId: p.brandId,
-        planId: p.planId,
-        GBs: Number(p.GBs),
-        Validity_Days: Number(p.Validity_Days),
-        retailRate: Number(p.retailRate),
-        dealerRate: Number(p.dealerRate ?? 0),
-        usku: p.usku,
-        description: p.Description
-      }))
-      .sort((a, b) => a.GBs - b.GBs || a.Validity_Days - b.Validity_Days || a.retailRate - b.retailRate);
-
-    const top3Text = formatTopPlans(normalized, 3);
+    const topText = formatPlans(normalized, limit);  // longer list (default 10)
+    const top3Text = formatPlans(normalized, 3);     // short list if needed
 
     const out = {
       label,
       iso2,
       isRegion,
       totalPlans: normalized.length,
-      plans: normalized,
+      plans: normalized,   // full normalized list incl. Unlimited
+      topText,
       top3Text
     };
 
-    console.log(`[plans-by-destination] "${destination}" -> ${label}/${iso2} (plans=${normalized.length})`);
+    console.log(`[plans-by-destination] "${destination}" -> ${label}/${iso2} (plans=${normalized.length}, limit=${limit})`);
     return res.json(out);
   } catch (e) {
     console.error("[plans-by-destination] ERROR", e);
