@@ -1,8 +1,8 @@
 // server.js
 // Minimal proxy for Retell/agents
 // - /balance-clean: eSIMGo usage + friendly country/region
-// - /plans-by-destination: GlobalESIM coverage -> plans summary
 // - /balance: raw eSIMGo passthrough
+// - /plans-by-destination: GlobalESIM coverage -> plans summary (form-encoded, PHP-friendly)
 // CommonJS + Node 18+ (global fetch)
 
 const express = require("express");
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8787;
 
 // ---- eSIMGo config ----
 const ESIMGO_KEY = process.env.ESIMGO_KEY;               // REQUIRED
-const ESIMGO_VER = process.env.ESIMGO_VER || "v2.5";
+const ESIMGO_VER = process.env.ESIMGO_VER || "v2.5";     // e.g., "v2.4" if needed
 
 // ---- GlobalESIM config ----
 const GLOBALESIM_EMAIL = process.env.GLOBALESIM_EMAIL || "";
@@ -101,7 +101,6 @@ function normalizeDestination(s = "") {
   return String(s).trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-// Try to pick a coverage record given user phrase and the API list
 function pickCoverageRecord(dest, coverageList = []) {
   const want = normalizeDestination(dest);
 
@@ -136,6 +135,29 @@ function formatTopPlans(plans = [], limit = 5) {
   return top
     .map(p => `${Number(p.GBs)} GB / ${Number(p.Validity_Days)} days — $${Number(p.retailRate)}`)
     .join("; ");
+}
+
+// ---- Form helpers (for PHP endpoints) ----
+function formBody(obj) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v !== undefined && v !== null) params.append(k, String(v));
+  }
+  return params.toString();
+}
+
+async function postForm(url, data) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "*/*",
+      "User-Agent": "esim-proxy/1.0"
+    },
+    body: formBody(data)
+  });
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text };
 }
 
 // ---- Routes ----
@@ -206,32 +228,45 @@ app.all("/balance", async (req, res) => {
   }
 });
 
-// GlobalESIM: coverage -> plans by destination
-// Body: { "destination": "Europe" } or { "destination": "Spain" }
-app.post("/plans-by-destination", async (req, res) => {
+// GlobalESIM: coverage -> plans by destination (form-encoded; tolerant to Retell probes; fallback to .php)
+app.all("/plans-by-destination", async (req, res) => {
   try {
-    const destination = String(req.body?.destination || "").trim();
-    if (!destination) return res.status(400).json({ error: "missing destination" });
+    // Accept from body or query; default "Europe" for save/probes with no payload
+    let destination =
+      (req.body && req.body.destination) ||
+      (req.query && req.query.destination) ||
+      "Europe";
+
+    destination = String(destination).trim();
+    if (!destination) destination = "Europe";
 
     if (!GLOBALESIM_EMAIL || !GLOBALESIM_PASSWORD) {
       return res.status(500).json({ error: "config_error", detail: "GLOBALESIM_EMAIL/PASSWORD not set" });
     }
 
-    // 1) Coverage lookup
-    const covResp = await fetch("https://globalesim.net/api/coverage", {
-      method: "POST",
-      headers: { "Accept": "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({
+    // 1) Coverage lookup (form-encoded). Try /api/coverage, fallback to /api/coverage.php
+    let cov = await postForm("https://globalesim.net/api/coverage", {
+      email: GLOBALESIM_EMAIL,
+      password: GLOBALESIM_PASSWORD
+    });
+
+    if (!cov.ok) {
+      console.log(`[coverage] status=${cov.status} len=${cov.text.length}`);
+      cov = await postForm("https://globalesim.net/api/coverage.php", {
         email: GLOBALESIM_EMAIL,
         password: GLOBALESIM_PASSWORD
-      })
-    });
-    const covText = await covResp.text();
-    if (!covResp.ok) return res.status(covResp.status).type("application/json").send(covText);
+      });
+      if (!cov.ok) {
+        return res.status(cov.status).type("application/json").send(cov.text);
+      }
+    }
 
-    const covJson = JSON.parse(covText);
+    let covJson;
+    try { covJson = JSON.parse(cov.text); } catch {
+      return res.status(502).json({ error: "bad_coverage_payload", raw: cov.text.slice(0, 400) });
+    }
+
     const list = Array.isArray(covJson?.Data) ? covJson.Data : [];
-
     const rec = pickCoverageRecord(destination, list);
     if (!rec) {
       return res.status(404).json({
@@ -241,28 +276,37 @@ app.post("/plans-by-destination", async (req, res) => {
       });
     }
 
-    // rec example: { id, country, iso2, region: "Yes"/"No" }
-    const label = rec.country;                   // "EU+" or "Spain"
-    const iso2 = rec.iso2;                       // "EU" or "ES"
+    const label = rec.country;                         // "EU+" or "Spain"
+    const iso2 = rec.iso2;                             // "EU" or "ES"
     const isRegion = String(rec.region || "").toLowerCase() === "yes";
 
-    // 2) Plans lookup
-    const plansResp = await fetch("https://globalesim.net/api/country-plans", {
-      method: "POST",
-      headers: { "Accept": "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({
+    // 2) Plans lookup (form-encoded). Try /api/country-plans, fallback to .php
+    let plans = await postForm("https://globalesim.net/api/country-plans", {
+      email: GLOBALESIM_EMAIL,
+      password: GLOBALESIM_PASSWORD,
+      iso2_country: iso2
+    });
+
+    if (!plans.ok) {
+      console.log(`[country-plans] status=${plans.status} len=${plans.text.length}`);
+      plans = await postForm("https://globalesim.net/api/country-plans.php", {
         email: GLOBALESIM_EMAIL,
         password: GLOBALESIM_PASSWORD,
         iso2_country: iso2
-      })
-    });
-    const plansText = await plansResp.text();
-    if (!plansResp.ok) return res.status(plansResp.status).type("application/json").send(plansText);
+      });
+      if (!plans.ok) {
+        return res.status(plans.status).type("application/json").send(plans.text);
+      }
+    }
 
-    const plansJson = JSON.parse(plansText);
+    let plansJson;
+    try { plansJson = JSON.parse(plans.text); } catch {
+      return res.status(502).json({ error: "bad_plans_payload", raw: plans.text.slice(0, 400) });
+    }
+
     const plansRaw = Array.isArray(plansJson?.Data) ? plansJson.Data : [];
 
-    const plans = plansRaw
+    const normalized = plansRaw
       .map(p => ({
         brandId: p.brandId,
         planId: p.planId,
@@ -275,18 +319,18 @@ app.post("/plans-by-destination", async (req, res) => {
       }))
       .sort((a, b) => a.GBs - b.GBs || a.Validity_Days - b.Validity_Days || a.retailRate - b.retailRate);
 
-    const top3Text = formatTopPlans(plans, 3);
+    const top3Text = formatTopPlans(normalized, 3);
 
     const out = {
-      label,       // "EU+" or "Spain"
-      iso2,        // "EU" or "ES"
-      isRegion,    // true/false
-      totalPlans: plans.length,
-      plans,       // normalized list
-      top3Text     // speech-ready summary (up to 3)
+      label,
+      iso2,
+      isRegion,
+      totalPlans: normalized.length,
+      plans: normalized,
+      top3Text
     };
 
-    console.log(`[plans-by-destination] "${destination}" -> ${label}/${iso2} (plans=${plans.length})`);
+    console.log(`[plans-by-destination] "${destination}" -> ${label}/${iso2} (plans=${normalized.length})`);
     return res.json(out);
   } catch (e) {
     console.error("[plans-by-destination] ERROR", e);
