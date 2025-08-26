@@ -222,8 +222,8 @@ app.post("/plans-by-destination", async (req, res) => {
       method: "POST",
       headers: { "Accept": "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: ivan.warman@globalvoiceconnect.com,
-        password: Ivan2024@
+        email: GLOBALESIM_EMAIL,
+        password: GLOBALESIM_PASSWORD
       })
     });
     const covText = await covResp.text();
@@ -251,8 +251,8 @@ app.post("/plans-by-destination", async (req, res) => {
       method: "POST",
       headers: { "Accept": "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: ivan.warman@globalvoiceconnect.com,
-        password: Ivan2024@,
+        email: GLOBALESIM_EMAIL,
+        password: GLOBALESIM_PASSWORD,
         iso2_country: iso2
       })
     });
