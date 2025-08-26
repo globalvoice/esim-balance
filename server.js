@@ -77,7 +77,193 @@ function extractRegionOrIso2(planName = "") {
   const regionMatch = planName.match(/_([A-Z]{3,5})(?:_[Vv]\d+)?$/);
   if (regionMatch) {
     const code = regionMatch[1];
-    if (REGION_CODES[code]) return { type: "region", code, label: REGION_CODES[code] };
+    if (REGION_CODES[code]) return { type: "region", code, label: REGION_CODES[code] };// server.js
+// Minimal eSIMgo proxy for Retell/agents: returns GB + friendly country/region label.
+
+import express from "express";
+
+const app = express();
+const PORT = process.env.PORT || 8787;
+const ESIMGO_KEY = process.env.ESIMGO_KEY;               // REQUIRED
+const ESIMGO_VER = process.env.ESIMGO_VER || "v2.5";     // set to v2.4 if your tenant needs it
+
+// ---- Basic hardening / JSON ----
+app.disable("x-powered-by");
+app.use(express.json());
+
+// ---- Utilities ----
+const toGB = (n) => Number((Number(n || 0) / 1_000_000_000).toFixed(2));
+
+function pickIccid(req) {
+  // Accept ICCID from body, query, or header (flexible for any client/agent)
+  return String(
+    (req.body && req.body.iccid) ||
+    (req.query && req.query.iccid) ||
+    req.headers["x-iccid"] ||
+    ""
+  ).trim();
+}
+
+// ---- Region & Country Maps ----
+const ISO2_COUNTRIES = {
+  US: "United States",
+  GB: "United Kingdom",
+  GR: "Greece",
+  FR: "France",
+  ES: "Spain",
+  IT: "Italy",
+  DE: "Germany",
+  NL: "Netherlands",
+  PT: "Portugal",
+  IE: "Ireland",
+  IL: "Israel",
+  BE: "Belgium",
+  AT: "Austria",
+  CH: "Switzerland",
+  SE: "Sweden",
+  NO: "Norway",
+  DK: "Denmark",
+  FI: "Finland",
+  CZ: "Czechia",
+  PL: "Poland",
+  RO: "Romania",
+  HU: "Hungary",
+  SK: "Slovakia",
+  BG: "Bulgaria",
+  HR: "Croatia",
+  SI: "Slovenia",
+  EE: "Estonia",
+  LV: "Latvia",
+  LT: "Lithuania",
+  MX: "Mexico",
+  RU: "Russia",
+  // add more ISO2 codes as needed
+};
+
+// Region or marketing bundle codes (end-of-name tokens like _REUP_V2)
+const REGION_CODES = {
+  REUP: "Europe+",
+  EURO: "Europe",
+  APAC: "Asia Pacific",
+  LATAM: "Latin America",
+  MENA: "Middle East & North Africa",
+  GLOBAL: "Global",
+};
+
+// Prefer region code; else ISO2 code; else empty label
+function extractRegionOrIso2Label(planName = "", description = "") {
+  // 1) Try 3–5 letter region codes at the end (e.g., _REUP, _APAC, _LATAM, optionally _V2)
+  const regionMatch = planName.match(/_([A-Z]{3,5})(?:_[Vv]\d+)?$/);
+  if (regionMatch) {
+    const r = regionMatch[1];
+    if (REGION_CODES[r]) return REGION_CODES[r];
+  }
+
+  // 2) Try ISO2 at the end (e.g., _GR, optionally _V2)
+  const isoMatch = planName.match(/_([A-Z]{2})(?:_[Vv]\d+)?$/);
+  if (isoMatch) {
+    const c = isoMatch[1];
+    if (ISO2_COUNTRIES[c]) return ISO2_COUNTRIES[c];
+  }
+
+  // 3) Optional: try to sniff an ISO2 code inside the description (very loose)
+  const descIso = description.match(/(?:^|[^A-Z])([A-Z]{2})(?:[^A-Z]|$)/);
+  if (descIso && ISO2_COUNTRIES[descIso[1]]) return ISO2_COUNTRIES[descIso[1]];
+
+  return "";
+}
+
+// ---- Routes ----
+app.get("/health", (req, res) => res.json({ ok: true, ver: ESIMGO_VER }));
+
+// Unified clean endpoint (supports GET with ?iccid=... or POST with { iccid })
+// Returns: { planName, description, country, bundleState, validFrom, validUntil, initialGB, remainingGB }
+app.all("/balance-clean", async (req, res) => {
+  try {
+    if (!ESIMGO_KEY) {
+      return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY env var not set" });
+    }
+
+    const iccid = pickIccid(req);
+    if (!iccid) return res.status(400).json({ error: "missing iccid" });
+
+    const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
+    console.log(`[balance-clean] ${req.method} -> ${url}`);
+
+    const r = await fetch(url, {
+      headers: { "X-API-Key": ESIMGO_KEY, "Accept": "application/json" },
+    });
+
+    const text = await r.text();
+    if (!r.ok) {
+      console.log(`[balance-clean] esimgo status=${r.status} body=${text.slice(0, 200)}…`);
+      return res.status(r.status).type("application/json").send(text);
+    }
+
+    const data = JSON.parse(text);
+    const b = data?.bundles?.[0] || {};
+    const a = b?.assignments?.[0] || {};
+
+    const planName = a?.name || b?.name || "";
+    const description = a?.description || b?.description || "";
+
+    // Bytes → GB, with allowances fallback
+    const initialBytes   = a?.initialQuantity ?? a?.allowances?.[0]?.initialAmount ?? 0;
+    const remainingBytes = a?.remainingQuantity ?? a?.allowances?.[0]?.remainingAmount ?? 0;
+
+    // Country/Region label
+    const label = extractRegionOrIso2Label(planName, description); // "Europe+", "Greece", etc.
+
+    const out = {
+      planName,
+      description,
+      country: label, // human-friendly region/country
+      bundleState: String(a?.bundleState || "").toLowerCase(),
+      validFrom: a?.startTime || a?.assignmentDateTime || "",
+      validUntil: a?.endTime || "",
+      initialGB: toGB(initialBytes),
+      remainingGB: toGB(remainingBytes),
+    };
+
+    console.log(`[balance-clean] ok -> ${JSON.stringify(out)}`);
+    res.json(out);
+  } catch (e) {
+    console.error("[balance-clean] ERROR", e);
+    res.status(500).json({ error: "proxy_error", detail: String(e) });
+  }
+});
+
+// Optional: raw passthrough if you ever need full JSON
+app.all("/balance", async (req, res) => {
+  try {
+    if (!ESIMGO_KEY) {
+      return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY env var not set" });
+    }
+
+    const iccid = pickIccid(req);
+    if (!iccid) return res.status(400).json({ error: "missing iccid" });
+
+    const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
+    console.log(`[balance] ${req.method} -> ${url}`);
+
+    const r = await fetch(url, {
+      headers: { "X-API-Key": ESIMGO_KEY, "Accept": "application/json" },
+    });
+
+    const text = await r.text();
+    res.status(r.status).type("application/json").send(text);
+  } catch (e) {
+    console.error("[balance] ERROR", e);
+    res.status(500).json({ error: "proxy_error", detail: String(e) });
+  }
+});
+
+// ---- Start ----
+app.listen(PORT, () => {
+  console.log(`listening on :${PORT}`);
+  if (!ESIMGO_KEY) console.warn("[WARN] ESIMGO_KEY is not set");
+});
+
   }
 
   // Otherwise check for ISO2 at the end
