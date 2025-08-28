@@ -1,6 +1,6 @@
 // server.js
 // Minimal proxy for Retell/agents
-// - /balance-clean, /balance: eSIMGo usage (GB) + friendly country/region (multiple ICCID input styles)
+// - /balance-clean, /balance: eSIMGo usage (GB) + friendly country/region (robust ICCID intake & sanitization)
 // - /plans-by-destination: GlobalESIM coverage -> plans (form-encoded, PHP-friendly, includes Unlimited, limitable)
 // - /health
 
@@ -22,20 +22,68 @@ app.disable("x-powered-by");
 app.use(express.json());
 app.use(express.urlencoded({ extended: false })); // allow form bodies if a client sends them
 
-// ---- Helpers ----
+// ========================= Helpers =========================
 const toGB = (n) => Number((Number(n || 0) / 1_000_000_000).toFixed(2));
 
+// ICCID sanitize/config
+const MIN_ICCID_LEN = Number(process.env.MIN_ICCID_LEN || 18);
+const MAX_ICCID_LEN = Number(process.env.MAX_ICCID_LEN || 22);
+
+function extractDigitsLongest(value) {
+  const s = String(value ?? "");
+  const matches = s.match(/\d{15,22}/g);
+  if (!matches) return "";
+  return matches.sort((a, b) => b.length - a.length)[0];
+}
+
+function sanitizeIccid(value) {
+  const onlyDigits = String(value ?? "").replace(/\D+/g, "");
+  const best = extractDigitsLongest(onlyDigits.length ? onlyDigits : value);
+  return best || "";
+}
+
+function isIccidLengthOK(iccid) {
+  return iccid.length >= MIN_ICCID_LEN && iccid.length <= MAX_ICCID_LEN;
+}
+
+function safeGet(obj, pathArr) {
+  try { return pathArr.reduce((o, k) => (o && k in o ? o[k] : undefined), obj); }
+  catch { return undefined; }
+}
+
+// Accept ICCID from path, query, headers, or many body shapes; sanitize to digits-only (handles spaces)
 function pickIccid(req) {
-  // Accept ICCID from body, nested body, query, header, or path.
-  // Covers Retell variants and manual curl tests.
-  return String(
-    (req.params && req.params.iccid) ||
-    (req.body && (req.body.iccid ||
-                  (req.body.arguments && req.body.arguments.iccid))) ||
-    (req.query && (req.query.iccid || req.query.ICCID)) ||
-    req.headers["x-iccid"] ||
-    ""
-  ).trim();
+  const candidates = [];
+
+  // path / query / headers
+  candidates.push(req.params?.iccid);
+  candidates.push(req.query?.iccid, req.query?.ICCID);
+  candidates.push(req.headers["x-iccid"], req.headers["x-iccid-number"]);
+
+  // body shapes (Retell / generic tools)
+  const b = req.body;
+  if (b) {
+    if (typeof b === "string") candidates.push(b);
+    if (typeof b === "object") {
+      candidates.push(b.iccid, b.ICCID, b.value, b.number);
+      candidates.push(safeGet(b, ["arguments", "iccid"]), safeGet(b, ["arguments", "ICCID"]));
+      candidates.push(safeGet(b, ["tool_input", "iccid"]), safeGet(b, ["tool_input", "ICCID"]));
+      candidates.push(safeGet(b, ["payload", "iccid"]), safeGet(b, ["payload", "ICCID"]));
+      if (Array.isArray(b) && b.length) {
+        candidates.push(b[0]?.iccid, b[0]?.ICCID);
+      }
+    }
+  }
+
+  // sanitize and choose the first valid-looking one
+  for (const cand of candidates) {
+    const cleaned = sanitizeIccid(cand);
+    if (cleaned && isIccidLengthOK(cleaned)) return cleaned;
+  }
+
+  // last resort: take the longest digit run across all candidates
+  const fallback = sanitizeIccid(candidates.filter(Boolean).join(" "));
+  return fallback || "";
 }
 
 // ---- Region & Country Maps (for planName parsing) ----
@@ -93,7 +141,7 @@ function extractRegionOrIso2Label(planName = "", description = "") {
   const isoMatch = planName.match(/_([A-Z]{2})(?:_[Vv]\d+)?$/);
   if (isoMatch && ISO2_COUNTRIES[isoMatch[1]]) return ISO2_COUNTRIES[isoMatch[1]];
 
-  // 3) Very loose ISO2 sniff in description
+  // 3) Loose ISO2 sniff in description
   const descIso = description.match(/(?:^|[^A-Z])([A-Z]{2})(?:[^A-Z]|$)/);
   if (descIso && ISO2_COUNTRIES[descIso[1]]) return ISO2_COUNTRIES[descIso[1]];
 
@@ -108,26 +156,25 @@ function normalizeDestination(s = "") {
 function pickCoverageRecord(dest, coverageList = []) {
   const want = normalizeDestination(dest);
 
-  // 1) exact match on country
+  // exact match on country
   let rec = coverageList.find(r => normalizeDestination(r.country) === want);
   if (rec) return rec;
 
-  // 2) common variants for Europe
+  // common variants for Europe
   const variants = new Set([want]);
   if (want === "europe") variants.add("eu+"), variants.add("eu");
   if (want === "eu") variants.add("eu+"), variants.add("europe");
   if (want === "eu+") variants.add("europe"), variants.add("eu");
-
   for (const v of variants) {
     rec = coverageList.find(r => normalizeDestination(r.country) === v);
     if (rec) return rec;
   }
 
-  // 3) substring fallback (e.g., “spai” -> “Spain”)
+  // substring fallback (e.g., “spai” -> “Spain”)
   rec = coverageList.find(r => normalizeDestination(r.country).includes(want));
   if (rec) return rec;
 
-  // 4) allow direct ISO2 (e.g., “ES”)
+  // direct ISO2 (e.g., “ES”)
   rec = coverageList.find(r => normalizeDestination(r.iso2) === want);
   if (rec) return rec;
 
@@ -153,7 +200,7 @@ function normalizePlanRecord(p) {
     brandId: p.brandId,
     planId: p.planId,
     GBs: isUnlimited ? "Unlimited" : Number(p.GBs),
-    gbsNum, // for sorting
+    gbsNum,
     Validity_Days: Number(p.Validity_Days),
     retailRate: Number(p.retailRate),
     dealerRate: Number(p.dealerRate ?? 0),
@@ -207,19 +254,19 @@ async function postForm(url, data) {
   return { ok: r.ok, status: r.status, text };
 }
 
-// ---- Routes ----
+// ========================= Routes =========================
 
 app.get("/health", (req, res) => res.json({ ok: true, ver: ESIMGO_VER }));
 
-// eSIMGo: processed usage (path, query, body all supported)
+// eSIMGo: processed usage (path, query, body all supported, ICCID sanitized)
 app.all("/balance-clean/:iccid?", async (req, res) => {
   try {
     if (!ESIMGO_KEY) return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY not set" });
 
     const iccid = pickIccid(req);
-    if (!iccid) {
-      console.log("[balance-clean] missing iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
-      return res.status(400).json({ error: "missing iccid" });
+    if (!iccid || !isIccidLengthOK(iccid)) {
+      console.log("[balance-clean] missing/invalid iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
+      return res.status(400).json({ error: "missing_or_invalid_iccid" });
     }
 
     const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
@@ -235,7 +282,7 @@ app.all("/balance-clean/:iccid?", async (req, res) => {
 
     const planName = a?.name || b?.name || "";
     const description = a?.description || b?.description || "";
-    const label = extractRegionOrIso2Label(planName, description); // country/region
+    const label = extractRegionOrIso2Label(planName, description); // country/region label
 
     const initialBytes   = a?.initialQuantity ?? a?.allowances?.[0]?.initialAmount ?? 0;
     const remainingBytes = a?.remainingQuantity ?? a?.allowances?.[0]?.remainingAmount ?? 0;
@@ -243,7 +290,7 @@ app.all("/balance-clean/:iccid?", async (req, res) => {
     const out = {
       planName,
       description,
-      country: label, // human-friendly country/region
+      country: label, // friendly
       bundleState: String(a?.bundleState || "").toLowerCase(),
       validFrom: a?.startTime || a?.assignmentDateTime || "",
       validUntil: a?.endTime || "",
@@ -259,15 +306,15 @@ app.all("/balance-clean/:iccid?", async (req, res) => {
   }
 });
 
-// eSIMGo: raw passthrough (path, query, body all supported)
+// eSIMGo: raw passthrough (path, query, body all supported, ICCID sanitized)
 app.all("/balance/:iccid?", async (req, res) => {
   try {
     if (!ESIMGO_KEY) return res.status(500).json({ error: "config_error", detail: "ESIMGO_KEY not set" });
 
     const iccid = pickIccid(req);
-    if (!iccid) {
-      console.log("[balance] missing iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
-      return res.status(400).json({ error: "missing iccid" });
+    if (!iccid || !isIccidLengthOK(iccid)) {
+      console.log("[balance] missing/invalid iccid", { query: req.query, hasBody: !!req.body, headers: { 'x-iccid': req.headers['x-iccid'] } });
+      return res.status(400).json({ error: "missing_or_invalid_iccid" });
     }
 
     const url = `https://api.esim-go.com/${ESIMGO_VER}/esims/${iccid}/bundles`;
@@ -287,8 +334,8 @@ app.all("/plans-by-destination", async (req, res) => {
   try {
     // Accept from body or query; default "Europe" for save/probes with no payload
     let destination =
-      (req.body && (req.body.destination || (req.body.arguments && req.body.arguments.destination))) ||
-      (req.query && (req.query.destination)) ||
+      (req.body && (req.body.destination || safeGet(req.body, ["arguments", "destination"]))) ||
+      (req.query && req.query.destination) ||
       "Europe";
 
     destination = String(destination || "").trim();
@@ -334,8 +381,8 @@ app.all("/plans-by-destination", async (req, res) => {
       });
     }
 
-    const label = rec.country;                         // "EU+" or "Spain"
-    const iso2 = rec.iso2;                             // "EU" or "ES"
+    const label = rec.country; // "EU+" or "Spain"
+    const iso2 = rec.iso2;     // "EU" or "ES"
     const isRegion = String(rec.region || "").toLowerCase() === "yes";
 
     // 2) Plans lookup (form-encoded). Try /api/country-plans, fallback to .php
@@ -386,7 +433,7 @@ app.all("/plans-by-destination", async (req, res) => {
   }
 });
 
-// ---- Start ----
+// ========================= Start =========================
 app.listen(PORT, () => {
   console.log(`listening on :${PORT}`);
   if (!ESIMGO_KEY) console.warn("[WARN] ESIMGO_KEY is not set");
